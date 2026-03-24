@@ -1,0 +1,816 @@
+---
+title: "Spatio-Temporal Analysis and Prediction of Urban Crime in Chicago"
+output:
+  word_document: default
+  pdf_document: default
+date: "2026-03-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load Packages
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(tmap)
+library(spdep)
+library(forecast)
+library(tseries)
+library(randomForest)
+library(Metrics)
+library(viridis)
+library(gridExtra)
+library(zoo)
+library(rsample)
+```
+
+```{r}
+# Load files
+crime_raw <- read.csv("/Users/lu_nanxi/CASA/STDM/crime_data.csv", stringsAsFactors = FALSE)
+
+# Inspect columns
+str(crime_raw)
+head(crime_raw)
+
+```
+
+```{r}
+# Data Cleaning
+crime <- crime_raw %>%
+  filter(!is.na(Latitude), !is.na(Longitude), !is.na(Date)) %>%
+  mutate(
+    Date = parse_date_time(Date, orders = c("mdy HMS", "mdy HM", "ymd HMS", "ymd HM"))
+  ) %>%
+  filter(!is.na(Date)) %>%
+  mutate(
+    year = year(Date),
+    month = month(Date),
+    month_name = month(Date, label = TRUE, abbr = TRUE),
+    day = day(Date),
+    wday = wday(Date, label = TRUE, abbr = FALSE),
+    hour = hour(Date),
+    year_month = floor_date(Date, unit = "month")
+  ) %>%
+  filter(year >= 2022, year <= 2024)
+```
+
+```{r}
+# Convert to sf object
+crime_sf <- st_as_sf(
+  crime,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Reproject to a projected CRS suitable for Chicago
+# UTM zone 16N
+crime_sf_proj <- st_transform(crime_sf, 26916)
+```
+
+```{r}
+# ASPATIAL ESTDA
+# Summary statistics
+total_crimes <- nrow(crime)
+total_crimes
+
+# Monthly counts
+monthly_counts <- crime %>%
+  count(year_month, name = "crime_count") %>%
+  complete(
+    year_month = seq(min(year_month), max(year_month), by = "month"),
+    fill = list(crime_count = 0)
+  ) %>%
+  arrange(year_month)
+
+mean_monthly <- mean(monthly_counts$crime_count)
+sd_monthly <- sd(monthly_counts$crime_count)
+```
+
+```{r}
+# Temporal Analysis
+# Monthly time series plot
+ggplot(monthly_counts, aes(x = year_month, y = crime_count)) +
+  geom_line() + geom_point(size = 1) +
+  labs(
+    title = "Monthly crime counts",
+    x = "Month",
+    y = "Crime count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Hour by weekday heatmap
+heat_data <- crime %>%
+  count(wday, hour) %>%
+  mutate(
+    wday = factor(
+      wday,
+      levels = c(
+        "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday", "Sunday"
+      )
+    )
+  )
+
+ggplot(heat_data, aes(x = hour, y = wday, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "viridis") +
+  scale_x_continuous(breaks = seq(0, 23, by = 3)) +
+  labs(
+    title = "Crime intensity by hour and weekday",
+    x = "Hour of day",
+    y = "Day of week",
+    fill = "Count"
+  ) +
+  theme_minimal()
+```
+```{r}
+# Spatial join crime points to grid (crime area only)
+# Remove coordinate outliers first
+crime_clean <- crime %>%
+  filter(
+  !is.na(Latitude),
+  !is.na(Longitude),
+  !is.na(Date),
+  Longitude > -88,
+  Longitude < -87.5,
+  Latitude > 41.6,
+  Latitude < 42.05
+)
+
+# Rebuild sf object from cleaned data
+crime_sf <- st_as_sf(
+  crime_clean,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+crime_sf_proj <- st_transform(crime_sf, 26916)
+
+# Count crimes per grid cell
+grid_2km <- st_make_grid(
+  crime_sf_proj,
+  cellsize = 2000,
+  square = TRUE
+) %>%
+  st_as_sf() %>%
+  mutate(grid_id = row_number())
+
+# Join counts back to grid
+crime_grid_join <- st_join(crime_sf_proj, grid_2km, join = st_within)
+
+grid_counts <- crime_grid_join %>%
+  st_drop_geometry() %>%
+  count(grid_id, name = "crime_count")
+
+grid_sf <- grid_2km %>%
+  left_join(grid_counts, by = "grid_id") %>%
+  mutate(crime_count = replace_na(crime_count, 0))
+```
+
+```{r}
+# Choropleth map of counts
+tm_shape(grid_sf %>% filter(crime_count > 0)) +
+  tm_polygons(
+    col = "crime_count",
+    style = "quantile",
+    palette = "Reds",
+    title = "Crime count"
+  ) +
+  tm_borders(col = "white", lwd = 0.2) +
+  tm_layout(frame = FALSE)
+```
+
+```{r}
+# grid-based hotspot map
+grid_1km <- st_make_grid(crime_sf_proj, cellsize = 1000, square = TRUE) %>%
+  st_as_sf() %>%
+  mutate(cell_id = row_number())
+
+crime_grid_join_fine <- st_join(crime_sf_proj, grid_1km, join = st_within)
+
+fine_counts <- crime_grid_join_fine %>%
+  st_drop_geometry() %>%
+  count(cell_id, name = "crime_count")
+
+fine_grid_sf <- grid_1km %>%
+  left_join(fine_counts, by = "cell_id") %>%
+  mutate(crime_count = ifelse(is.na(crime_count), 0, crime_count))
+
+tm_shape(fine_grid_sf) +
+  tm_polygons(
+    col = "crime_count",
+    style = "fixed",
+    breaks = c(0, 100, 500, 1000, 3000, 12000),
+    palette = "Reds",
+    title = "Crime count"
+  ) +
+  tm_layout(frame = FALSE)
+```
+
+```{r}
+# Spatial Autocorrelation
+
+# Neighbours and weights 
+nb <- poly2nb(grid_sf)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Neighbourhood structure
+summary(card(nb))
+table(card(nb))
+
+# Global Moran's I
+moran_result <- moran.test(grid_sf$crime_count, lw, zero.policy = TRUE)
+moran_result
+
+# Local Moran's I
+local_moran <- localmoran(grid_sf$crime_count, lw, zero.policy = TRUE)
+
+grid_sf$Ii <- local_moran[, 1]
+grid_sf$Z_Ii <- local_moran[, 4]
+grid_sf$P_Ii <- local_moran[, 5]
+```
+
+```{r}
+# LISA cluster map
+lag_crime <- lag.listw(lw, grid_sf$crime_count, zero.policy = TRUE)
+
+crime_mean <- mean(grid_sf$crime_count, na.rm = TRUE)
+lag_mean <- mean(lag_crime, na.rm = TRUE)
+
+grid_sf <- grid_sf %>%
+  mutate(
+    crime_std = crime_count - crime_mean,
+    lag_std = lag_crime - lag_mean,
+    lisa_cluster = case_when(
+      crime_std > 0 & lag_std > 0 & P_Ii <= 0.05 ~ "High-High",
+      crime_std < 0 & lag_std < 0 & P_Ii <= 0.05 ~ "Low-Low",
+      crime_std > 0 & lag_std < 0 & P_Ii <= 0.05 ~ "High-Low",
+      crime_std < 0 & lag_std > 0 & P_Ii <= 0.05 ~ "Low-High",
+      TRUE ~ "Not significant"
+    )
+  )
+
+tm_shape(grid_sf) +
+  tm_polygons(
+    col = "lisa_cluster",
+    palette = c(
+      "High-High" = "red",
+      "Low-Low" = "blue",
+      "High-Low" = "orange",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey85"
+    ),
+    title = "LISA cluster"
+  ) +
+  tm_borders(col = "white", lwd = 0.2) +
+  tm_layout(frame = FALSE)
+```
+
+```{r}
+# Spatial-temporal map 2022, 2023, 2024
+years <- c(2022, 2023, 2024)
+
+for (y in years) {
+
+  crime_year <- crime_sf_proj %>%
+    filter(year == y)
+
+  crime_grid_year <- st_join(crime_year, grid_2km, join = st_within)
+
+  grid_counts_year <- crime_grid_year %>%
+    st_drop_geometry() %>%
+    count(grid_id, name = "crime_count")
+
+  grid_year <- grid_2km %>%
+    left_join(grid_counts_year, by = "grid_id") %>%
+    mutate(crime_count = replace_na(crime_count, 0))
+
+  print(
+    tm_shape(grid_year) +
+      tm_polygons(
+        col = "crime_count",
+        style = "fixed",
+        breaks = c(0, 100, 500, 1000, 3000, max(grid_year$crime_count)),
+        palette = "Reds"
+      ) +
+      tm_layout(
+        title = paste("Crime hotspots in Chicago,", y),
+        frame = FALSE
+      )
+  )
+}
+
+```
+
+```{r}
+# Temporal autocorrelation
+monthly_counts <- crime %>%
+  count(year_month, name = "crime_count") %>%
+  complete(
+    year_month = seq(min(year_month), max(year_month), by = "month"),
+    fill = list(crime_count = 0)
+  ) %>%
+  arrange(year_month)
+
+crime_ts <- ts(monthly_counts$crime_count, frequency = 12)
+
+# Plot series
+autoplot(crime_ts) +
+  labs(
+    title = "Monthly crime counts in Chicago",
+    x = "Time",
+    y = "Crime count"
+  ) +
+  theme_minimal()
+
+# Seasonal Decomposition
+crime_decomp <- stl(crime_ts, s.window = "periodic")
+autoplot(crime_decomp) +
+  labs(title = "STL decomposition of monthly crime counts") +
+  theme_minimal()
+
+# STL decomposition was used to examine whether the monthly crime series contained trend and seasonal components. Given the short time span of three years, the decomposition was interpreted cautiously.
+
+# ACF and PACF
+acf(crime_ts, main = "ACF of monthly crime counts")
+pacf(crime_ts, main = "PACF of monthly crime counts")
+
+adf_result <- adf.test(crime_ts)
+adf_result
+
+if (adf_result$p.value >= 0.05) {
+  crime_ts_diff <- diff(crime_ts)
+  
+  autoplot(crime_ts_diff) +
+    labs(
+      title = "Differenced monthly crime counts",
+      x = "Time",
+      y = "Differenced crime count"
+    ) +
+    theme_minimal()
+  
+  acf(crime_ts_diff, main = "ACF of differenced series")
+  pacf(crime_ts_diff, main = "PACF of differenced series")
+  
+  adf_diff_result <- adf.test(crime_ts_diff)
+  adf_diff_result
+}
+```
+```{r}
+# Weekly crime series
+weekly_counts <- crime %>%
+  mutate(year_week = floor_date(Date, unit = "week", week_start = 1)) %>%
+  count(year_week, name = "crime_count") %>%
+  complete(
+    year_week = seq(min(year_week), max(year_week), by = "week"),
+    fill = list(crime_count = 0)
+  ) %>%
+  arrange(year_week)
+
+weekly_counts <- weekly_counts %>%
+  filter(year_week < max(year_week))
+
+ggplot(weekly_counts, aes(x = year_week, y = crime_count)) +
+  geom_line() +
+  labs(
+    title = "Weekly crime counts in Chicago",
+    x = "Week",
+    y = "Crime count"
+  ) +
+  theme_minimal()
+
+crime_ts_weekly <- ts(weekly_counts$crime_count, frequency = 52)
+
+# Shared train/test split for all weekly time-series models
+n_ts_weekly <- length(crime_ts_weekly)
+train_size_weekly <- floor(0.8 * n_ts_weekly)
+
+train_ts_weekly <- ts(
+  weekly_counts$crime_count[1:train_size_weekly],
+  frequency = 52
+)
+
+test_ts_weekly <- ts(
+  weekly_counts$crime_count[(train_size_weekly + 1):n_ts_weekly],
+  frequency = 52
+)
+
+test_dates_weekly <- weekly_counts$year_week[(train_size_weekly + 1):n_ts_weekly]
+
+# STL decomposition
+crime_decomp_weekly <- stl(crime_ts_weekly, s.window = "periodic")
+autoplot(crime_decomp_weekly) +
+  labs(title = "STL decomposition of weekly crime counts") +
+  theme_minimal()
+
+# ACF and PACF
+acf(crime_ts_weekly, main = "ACF of weekly crime counts")
+pacf(crime_ts_weekly, main = "PACF of weekly crime counts")
+
+# ADF test
+adf_result_weekly <- adf.test(crime_ts_weekly)
+adf_result_weekly
+
+if (adf_result_weekly$p.value >= 0.05) {
+  crime_ts_weekly_diff <- diff(crime_ts_weekly)
+
+  autoplot(crime_ts_weekly_diff) +
+    labs(
+      title = "Differenced weekly crime counts",
+      x = "Time",
+      y = "Differenced crime count"
+    ) +
+    theme_minimal()
+
+  acf(crime_ts_weekly_diff, main = "ACF of differenced weekly series")
+  pacf(crime_ts_weekly_diff, main = "PACF of differenced weekly series")
+
+  adf_diff_result_weekly <- adf.test(crime_ts_weekly_diff)
+  adf_diff_result_weekly
+}
+```
+
+```{r}
+# Naive baseline model
+naive_fc_weekly <- naive(train_ts_weekly, h = length(test_ts_weekly))
+
+naive_rmse <- rmse(as.numeric(test_ts_weekly), as.numeric(naive_fc_weekly$mean))
+naive_mae  <- mae(as.numeric(test_ts_weekly), as.numeric(naive_fc_weekly$mean))
+
+naive_plot_data <- tibble(
+  year_week = test_dates_weekly,
+  actual = as.numeric(test_ts_weekly),
+  predicted = as.numeric(naive_fc_weekly$mean)
+)
+
+ggplot(naive_plot_data, aes(x = year_week)) +
+  geom_line(aes(y = actual, linetype = "Actual")) +
+  geom_line(aes(y = predicted, linetype = "Predicted")) +
+  labs(
+    title = "Naive baseline versus actual weekly crime counts",
+    x = "Week",
+    y = "Crime count",
+    linetype = ""
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Non-seasonal ARIMA
+arima_model_ns <- auto.arima(train_ts_weekly, seasonal = FALSE)
+summary(arima_model_ns)
+checkresiduals(arima_model_ns)
+
+arima_fc_ns <- forecast(arima_model_ns, h = length(test_ts_weekly))
+
+arima_ns_rmse <- rmse(as.numeric(test_ts_weekly), as.numeric(arima_fc_ns$mean))
+arima_ns_mae  <- mae(as.numeric(test_ts_weekly), as.numeric(arima_fc_ns$mean))
+
+arima_ns_plot_data <- tibble(
+  year_week = test_dates_weekly,
+  actual = as.numeric(test_ts_weekly),
+  predicted = as.numeric(arima_fc_ns$mean)
+)
+
+ggplot(arima_ns_plot_data, aes(x = year_week)) +
+  geom_line(aes(y = actual, linetype = "Actual")) +
+  geom_line(aes(y = predicted, linetype = "Predicted")) +
+  labs(
+    title = "Non-seasonal ARIMA versus actual weekly crime counts",
+    x = "Week",
+    y = "Crime count",
+    linetype = ""
+  ) +
+  theme_minimal()
+
+# Seasonal SARIMA
+sarima_model <- auto.arima(train_ts_weekly, seasonal = TRUE)
+summary(sarima_model)
+checkresiduals(sarima_model)
+
+sarima_fc <- forecast(sarima_model, h = length(test_ts_weekly))
+
+sarima_rmse <- rmse(as.numeric(test_ts_weekly), as.numeric(sarima_fc$mean))
+sarima_mae  <- mae(as.numeric(test_ts_weekly), as.numeric(sarima_fc$mean))
+
+sarima_plot_data <- tibble(
+  year_week = test_dates_weekly,
+  actual = as.numeric(test_ts_weekly),
+  predicted = as.numeric(sarima_fc$mean)
+)
+
+ggplot(sarima_plot_data, aes(x = year_week)) +
+  geom_line(aes(y = actual, linetype = "Actual")) +
+  geom_line(aes(y = predicted, linetype = "Predicted")) +
+  labs(
+    title = "Seasonal SARIMA versus actual weekly crime counts",
+    x = "Week",
+    y = "Crime count",
+    linetype = ""
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Random Forest model weekly
+rf_data <- weekly_counts %>%
+  mutate(
+    week_num = isoweek(year_week),
+    year_num = year(year_week),
+    month_num = month(year_week),
+
+    lag1 = lag(crime_count, 1),
+    lag2 = lag(crime_count, 2),
+    lag3 = lag(crime_count, 3),
+    lag4 = lag(crime_count, 4),
+    lag12 = lag(crime_count, 12),
+    lag52 = lag(crime_count, 52),
+
+    roll_mean_4 = lag(rollmean(crime_count, k = 4, fill = NA, align = "right"), 1),
+    roll_mean_12 = lag(rollmean(crime_count, k = 12, fill = NA, align = "right"), 1),
+
+    sin_week = sin(2 * pi * week_num / 52),
+    cos_week = cos(2 * pi * week_num / 52)
+  ) %>%
+  filter(
+    !is.na(lag52),
+    !is.na(roll_mean_4),
+    !is.na(roll_mean_12)
+  )
+
+ggplot(rf_data, aes(x = year_week, y = crime_count)) +
+  geom_line() +
+  labs(
+    title = "Weekly crime counts used for Random Forest",
+    x = "Week",
+    y = "Crime count"
+  ) +
+  theme_minimal()
+
+# Train/test split for RF
+train_size_rf <- floor(0.8 * nrow(rf_data))
+
+rf_train <- rf_data[1:train_size_rf, ]
+rf_test  <- rf_data[(train_size_rf + 1):nrow(rf_data), ]
+
+XTrain <- rf_train %>%
+  select(
+    week_num, year_num, month_num,
+    lag1, lag2, lag3, lag4, lag12, lag52,
+    roll_mean_4, roll_mean_12,
+    sin_week, cos_week
+  )
+
+yTrain <- rf_train$crime_count
+
+XTest <- rf_test %>%
+  select(
+    week_num, year_num, month_num,
+    lag1, lag2, lag3, lag4, lag12, lag52,
+    roll_mean_4, roll_mean_12,
+    sin_week, cos_week
+  )
+
+yTest <- rf_test$crime_count
+
+set.seed(101)
+
+rf_model <- randomForest(
+  x = XTrain,
+  y = yTrain,
+  ntree = 500,
+  mtry = 4,
+  importance = TRUE
+)
+
+print(rf_model)
+
+rf_pred <- predict(rf_model, XTest)
+
+rf_rmse <- rmse(yTest, rf_pred)
+rf_mae  <- mae(yTest, rf_pred)
+
+rf_plot_data <- rf_test %>%
+  select(year_week, crime_count) %>%
+  mutate(predicted = rf_pred)
+
+ggplot(rf_plot_data, aes(x = year_week)) +
+  geom_line(aes(y = crime_count, linetype = "Actual")) +
+  geom_line(aes(y = predicted, linetype = "Predicted")) +
+  labs(
+    title = "Random Forest versus actual weekly crime counts",
+    x = "Week",
+    y = "Crime count",
+    linetype = ""
+  ) +
+  theme_minimal()
+
+varImpPlot(rf_model)
+
+```
+
+```{r}
+# Model comparison
+model_compare <- tibble(
+  Model = c("Naive", "ARIMA_nonseasonal", "SARIMA", "Random_Forest"),
+  RMSE = c(naive_rmse, arima_ns_rmse, sarima_rmse, rf_rmse),
+  MAE  = c(naive_mae, arima_ns_mae, sarima_mae, rf_mae)
+)
+
+model_compare
+
+model_compare_long <- model_compare %>%
+  pivot_longer(cols = c(RMSE, MAE), names_to = "Metric", values_to = "Value")
+
+ggplot(model_compare_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Model comparison of weekly crime forecasting methods",
+    x = "Model",
+    y = "Error"
+  ) +
+  theme_minimal()
+``` 
+
+```{r}
+# Combined prediction plot for time-series models
+combined_plot_data <- tibble(
+  year_week = test_dates_weekly,
+  actual = as.numeric(test_ts_weekly),
+  Naive = as.numeric(naive_fc_weekly$mean),
+  ARIMA_nonseasonal = as.numeric(arima_fc_ns$mean),
+  SARIMA = as.numeric(sarima_fc$mean)
+) %>%
+  pivot_longer(
+    cols = c(Naive, ARIMA_nonseasonal, SARIMA),
+    names_to = "Model",
+    values_to = "predicted"
+  )
+
+ggplot() +
+  geom_line(
+    data = combined_plot_data %>% distinct(year_week, actual),
+    aes(x = year_week, y = actual, linetype = "Actual")
+  ) +
+  geom_line(
+    data = combined_plot_data,
+    aes(x = year_week, y = predicted, colour = Model)
+  ) +
+  labs(
+    title = "Actual versus predicted weekly crime counts for time-series models",
+    x = "Week",
+    y = "Crime count",
+    linetype = ""
+  ) +
+  theme_minimal()
+```
+```{r}
+library(sf)
+library(dplyr)
+
+# check original CRS first
+st_crs(crime_sf)
+
+# force projection to Chicago UTM
+crime_sf_proj <- st_transform(crime_sf, 26916)
+
+# confirm
+st_crs(crime_sf_proj)
+st_bbox(crime_sf_proj)
+grid_5km <- st_make_grid(
+  st_as_sfc(st_bbox(crime_sf_proj)),
+  cellsize = 5000,
+  square = TRUE
+) %>%
+  st_as_sf() %>%
+  mutate(grid_id = row_number()) %>%
+  arrange(grid_id)
+
+crime_sf_proj <- crime_sf_proj %>%
+  mutate(year_week = floor_date(Date, unit = "week", week_start = 1))
+
+# join once
+crime_grid_week <- st_join(crime_sf_proj, grid_5km, join = st_within) %>%
+  filter(!is.na(grid_id))
+
+# keep only used cells
+used_ids <- crime_grid_week %>%
+  st_drop_geometry() %>%
+  distinct(grid_id) %>%
+  pull(grid_id)
+
+grid_5km <- grid_5km %>%
+  filter(grid_id %in% used_ids) %>%
+  arrange(grid_id)
+
+# Rejoin after filtering
+crime_grid_week <- st_join(crime_sf_proj, grid_5km, join = st_within) %>%
+  filter(!is.na(grid_id))
+
+# Count crimes by grid and week
+grid_week_counts <- crime_grid_week %>%
+  st_drop_geometry() %>%
+  count(grid_id, year_week, name = "crime_count")
+
+# Spatial neighbours and weights
+nb <- poly2nb(grid_5km)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Complete grid-week table
+grid_week_full <- grid_week_counts %>%
+  complete(
+    grid_id = grid_5km$grid_id,
+    year_week = seq(min(year_week), max(year_week), by = "week"),
+    fill = list(crime_count = 0)
+  ) %>%
+  arrange(year_week, grid_id)
+
+# Spatial lag
+n_cells <- nrow(grid_5km)
+
+calc_spatial_lag <- function(df_week, lw_obj, n_cells) {
+  df_week <- df_week %>%
+    arrange(grid_id)
+
+  if (nrow(df_week) != n_cells) {
+    stop("Row mismatch")
+  }
+
+  df_week$spatial_lag <- lag.listw(
+    lw_obj,
+    df_week$crime_count,
+    zero.policy = TRUE
+  )
+
+  df_week
+}
+
+grid_week_lagged <- grid_week_full %>%
+  group_by(year_week) %>%
+  group_modify(~ calc_spatial_lag(.x, lw, n_cells)) %>%
+  ungroup()
+
+# Temporal lags
+grid_week_model <- grid_week_lagged %>%
+  arrange(grid_id, year_week) %>%
+  group_by(grid_id) %>%
+  mutate(
+    lag1 = lag(crime_count, 1),
+    lag2 = lag(crime_count, 2),
+    lag4 = lag(crime_count, 4)
+  ) %>%
+  ungroup()
+
+# Prepare model data
+model_data <- grid_week_model %>%
+  filter(
+    !is.na(lag1),
+    !is.na(lag2),
+    !is.na(lag4),
+    !is.na(spatial_lag)
+  ) %>%
+  mutate(
+    week_num = isoweek(year_week),
+    year_num = year(year_week)
+  )
+
+# Train-test split
+train_size <- floor(0.8 * nrow(model_data))
+train_data <- model_data[1:train_size, ]
+test_data  <- model_data[(train_size + 1):nrow(model_data), ]
+
+x_train <- train_data %>%
+  select(lag1, lag2, lag4, spatial_lag, week_num, year_num)
+
+y_train <- train_data$crime_count
+
+x_test <- test_data %>%
+  select(lag1, lag2, lag4, spatial_lag, week_num, year_num)
+
+y_test <- test_data$crime_count
+
+# Random Forest
+set.seed(101)
+rf_spacetime <- randomForest(
+  x = x_train,
+  y = y_train,
+  ntree = 300,
+  importance = TRUE
+)
+
+# Predictions
+pred <- predict(rf_spacetime, x_test)
+
+# Evaluation
+rmse(y_test, pred)
+mae(y_test, pred)
+```
+
+
